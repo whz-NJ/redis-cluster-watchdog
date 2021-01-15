@@ -156,8 +156,9 @@ public class ThinGossip implements Resourcable {
         managers.server.myself.port = port;
         managers.server.myself.busPort = busPort;
     }
-    
-    public void clusterCron() {
+
+
+    public void clusterCron() { // WHZ 每 100ms 执行一次
         try {
             managers.server.iteration++;
             long now = System.currentTimeMillis();
@@ -181,7 +182,7 @@ public class ThinGossip implements Resourcable {
                     managers.nodes.clusterDelNode(node);
                     continue;
                 }
-                if (node.link != null) continue;
+                if (node.link != null) continue; // WHZ 链路已经有了，就不处理
                 
                 if (initiator == null) {
                     initiator = new NioBootstrapImpl<>(false, configuration.getNetworkConfiguration());
@@ -206,7 +207,8 @@ public class ThinGossip implements Resourcable {
                 link.createTime = System.currentTimeMillis();
                 long previousPingTime = node.pingTime;
                 boolean meet = nodeInMeet(node.flags);
-                managers.messages.clusterSendPing(link, meet ? CLUSTERMSG_TYPE_MEET : CLUSTERMSG_TYPE_PING);
+                managers.messages.clusterSendPing(link, meet ? CLUSTERMSG_TYPE_MEET : CLUSTERMSG_TYPE_PING); // WHZ 这里发送PING
+                                                                     // WHZ PING消息里本机管理的slot的configEpoch 是自己的configEpoch吗
                 if (previousPingTime != 0) node.pingTime = previousPingTime;
                 node.flags &= ~CLUSTER_NODE_MEET;
             }
@@ -214,9 +216,10 @@ public class ThinGossip implements Resourcable {
             long minPongTime = 0;
             ClusterNode minPongNode = null;
             List<ClusterNode> list = new ArrayList<>(managers.server.cluster.nodes.values());
-            
-            if (managers.server.iteration % 10 == 0) {
-                for (int i = 0; i < 5; i++) {
+            // WHZ 一般情况下一个节点每秒向随机的固定数量的节点发送PING（也收到固定数量节点的PONG），
+            // WHZ 所以不管集群有多少节点，单个节点每秒的PING包数量是固定的。
+            if (managers.server.iteration % 10 == 0) { // WHZ 每秒执行一次下面的处理
+                for (int i = 0; i < 5; i++) { // WHZ 随机选5个节点，给它发PING消息
                     ClusterNode t = list.get(current().nextInt(list.size()));
                     
                     if (nodeIsMyself(t.flags)) continue;
@@ -247,22 +250,24 @@ public class ThinGossip implements Resourcable {
                     if (slaves > maxSlaves) maxSlaves = slaves;
                     if (Objects.equals(myself.master, node)) mySlaves = slaves;
                 }
-                
+
+                //WHZ 长时间没有收到PONG，要么tcp连接出现问题，要么目标节点宕机导致无法响应心跳。首先怀疑tcp连接出现问题，进行重建。
+                //WHZ 如果一个超过NODE_TIMEOUT/2时长一个节点没有返回PONG，则认为到该节点的tcp连接出现问题，释放该tcp连接，在下一clusterCron会自动重建。
                 if (node.link != null
                         && now - node.link.createTime > nodeTimeout
                         && node.pingTime != 0 && node.pongTime < node.pingTime
                         && now - node.pingTime > nodeTimeout / 2) {
-                    
                     managers.connections.freeClusterLink(node.link);
                 }
-                
+                // WHZ 如果超过NODE_TIMEOUT/2时长没有向一个节点发送PING，会强制向其发送PING
                 if (node.link != null && node.pingTime == 0 && (now - node.pongTime) > nodeTimeout / 2) {
                     managers.messages.clusterSendPing(node.link, CLUSTERMSG_TYPE_PING);
                     continue;
                 }
                 
                 if (node.pingTime == 0) continue;
-                
+                // WHZ 如果sender向其他节点发送PING后，超过NODE_TIMEOUT仍没有收到pong，
+                // WHZ 则设置该节点为PFAIL。主节点和从节点都能将另一个节点设置成PFAIL。
                 if (now - node.pingTime > nodeTimeout && !nodePFailed(node.flags) && !nodeFailed(node.flags)) {
                     logger.debug("*** NODE " + node.name + " possibly failing");
                     node.flags |= CLUSTER_NODE_PFAIL;

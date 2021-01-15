@@ -72,7 +72,7 @@ public abstract class AbstractClusterMessageHandler implements ClusterMessageHan
     public boolean handle(ClusterLink link, ClusterMessage hdr) {
         if (hdr.type < CLUSTERMSG_TYPE_COUNT)
             server.cluster.messagesReceived[hdr.type]++;
-        if (hdr.version != configuration.getVersion()) return true;
+        if (hdr.version != configuration.getVersion()) return true; //如果redis版本号（配置不变的）不同丢弃
         ClusterNode sender = managers.nodes.clusterLookupNode(hdr.name);
         if (sender != null && !nodeInHandshake(sender)) {
             sender.configEpoch = max(hdr.configEpoch, sender.configEpoch);
@@ -82,7 +82,18 @@ public abstract class AbstractClusterMessageHandler implements ClusterMessageHan
         managers.states.clusterUpdateState();
         return true;
     }
-    
+
+    /* This function is called when we receive a master configuration via a
+     * PING, PONG or UPDATE packet. What we receive is a node, a configEpoch of the
+     * node, and the set of slots claimed under this configEpoch.
+     *
+     * What we do is to rebind the slots with newer configuration compared to our
+     * local configuration, and if needed, we turn ourself into a replica of the
+     * node (see the function comments for more info).
+     *
+     * The 'sender' is the node for which we received a configuration update.
+     * Sometimes it is not actually the "Sender" of the information, like in the
+     * case we receive the info via an UPDATE packet. */
     public void clusterUpdateSlotsConfigWith(ClusterNode sender, long senderConfigEpoch, byte[] slots) {
         ClusterNode myself = server.myself;
         ClusterNode previous = nodeIsMaster(myself) ? myself : myself.master;
@@ -98,6 +109,10 @@ public abstract class AbstractClusterMessageHandler implements ClusterMessageHan
             if (!bitmapTestBit(slots, i)) continue;
             if (Objects.equals(n, sender)) continue;
             if (server.cluster.importing[i] != null) continue;
+            /* We rebind the slot to the new node claiming it if:
+             * 1) The slot was unassigned or the new node claims it with a
+             *    greater configEpoch.
+             * 2) We are not currently importing the slot. */ // WHZ 这里比较版本，并更新 slot 信息
             if (n == null || n.configEpoch < senderConfigEpoch) {
                 ClusterSlotManager sm = managers.slots;
                 if (Objects.equals(n, previous)) next = sender;
@@ -109,7 +124,11 @@ public abstract class AbstractClusterMessageHandler implements ClusterMessageHan
         if (next != null && previous.assignedSlots == 0) managers.nodes.clusterSetMyMasterTo(sender);
         else if (!dirties.isEmpty()) dirties.stream().forEach(slot -> managers.slots.delKeysInSlot(slot));
     }
-    
+
+    /* Process the gossip section of PING or PONG packets.
+     * Note that this function assumes that the packet is already sanity-checked
+     * by the caller, not in the content of the gossip section, but in the
+     * length. */
     public void clusterProcessGossipSection(ClusterMessage hdr, ClusterLink link) {
         List<ClusterMessageDataGossip> gossips = hdr.data.gossips;
         ClusterNode sender = link.node != null ? link.node : managers.nodes.clusterLookupNode(hdr.name);
@@ -127,13 +146,15 @@ public abstract class AbstractClusterMessageHandler implements ClusterMessageHan
                 }
                 continue;
             }
-            
+            /* Update our state accordingly to the gossip sections */
+            /* We already know this node.
+               Handle failure reports, only when the sender is a master. */
             if (sender != null && nodeIsMaster(sender) && !Objects.equals(node, server.myself)) {
                 if (nodePFailed(gossip.flags) || nodeFailed(gossip.flags)) {
                     if (managers.nodes.clusterNodeAddFailureReport(node, sender) && configuration.isVerbose()) {
                         logger.info("Node " + sender.name + " reported node " + node.name + " as not reachable.");
                     }
-                    markNodeAsFailingIfNeeded(node);
+                    markNodeAsFailingIfNeeded(node); // WHZ 更新状态为 FAIL
                 } else if (managers.nodes.clusterNodeDelFailureReport(node, sender) && configuration.isVerbose()) {
                     logger.info("Node " + sender.name + " reported node " + node.name + " is back online.");
                 }
@@ -145,7 +166,12 @@ public abstract class AbstractClusterMessageHandler implements ClusterMessageHan
                     && gossip.pongTime <= (System.currentTimeMillis() + 500) && gossip.pongTime > node.pongTime) {
                 node.pongTime = gossip.pongTime;
             }
-            
+
+            /* If we already know this node, but it is not reachable, and
+             * we see a different address in the gossip section of a node that
+             * can talk with this other node, update the address, disconnect
+             * the old link if any, so that we'll attempt to connect with the
+             * new address. */
             if ((nodePFailed(node.flags) || nodeFailed(node.flags))
                     && nodeHasAddr(gossip.flags) && !nodePFailed(gossip.flags) && !nodeFailed(gossip.flags)
                     && (!node.ip.equalsIgnoreCase(gossip.ip) || node.port != gossip.port || node.busPort != gossip.busPort)) {
@@ -154,7 +180,7 @@ public abstract class AbstractClusterMessageHandler implements ClusterMessageHan
                 node.ip = gossip.ip;
                 node.port = gossip.port;
                 node.busPort = gossip.busPort;
-                node.flags &= ~CLUSTER_NODE_NOADDR;
+                node.flags &= ~CLUSTER_NODE_NOADDR; //WHZ 将 NOADDR 位置1
             }
         }
     }
@@ -178,7 +204,7 @@ public abstract class AbstractClusterMessageHandler implements ClusterMessageHan
         int quorum = server.cluster.size / 2 + 1;
         if (!nodePFailed(node) || nodeFailed(node)) return;
         int failures = managers.nodes.clusterNodeFailureReportsCount(node);
-        if (nodeIsMaster(server.myself)) failures++;
+        if (nodeIsMaster(server.myself)) failures++;  // WHZ 大部分 master 节点认为该节点挂了，才认为挂
         if (failures < quorum) return;
         logger.info("Marking node " + node.name + " as failing (quorum reached).");
         //

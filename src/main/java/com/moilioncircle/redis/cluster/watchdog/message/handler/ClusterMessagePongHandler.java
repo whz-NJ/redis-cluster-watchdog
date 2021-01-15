@@ -123,17 +123,21 @@ public class ClusterMessagePongHandler extends AbstractClusterMessageHandler {
         clusterProcessGossipSection(hdr, link);
         return true;
     }
-    
-    public void clearNodeFailureIfNeeded(ClusterNode node) {
+
+    /* This function is called only if a node is marked as FAIL, but we are able
+     * to reach it again. It checks if there are the conditions to undo the FAIL
+     * state. */
+    public void clearNodeFailureIfNeeded(ClusterNode node) { // WHZ 清除 FAIL 标志
         long now = System.currentTimeMillis();
         long timeout = managers.configuration.getClusterNodeTimeout() * CLUSTER_FAIL_UNDO_TIME_MULTI;
-        
-        if (nodeIsSlave(node) || node.assignedSlots == 0) {
+
+        // WHZ 节点可达，且他是从节点。因为从节点不需要被failover
+        if (nodeIsSlave(node) || node.assignedSlots == 0) { // WHZ 节点可达，且他是没有负责slots的主节点。在这种情况下，该主节点没有真正参与集群，且在等待配置以加入集群工作
             node.flags &= ~CLUSTER_NODE_FAIL;
             managers.notifyUnsetNodeFailed(valueOf(node, server.myself));
         }
         if (nodeIsMaster(node) && node.assignedSlots > 0 && now - node.failTime > timeout) {
-            node.flags &= ~CLUSTER_NODE_FAIL;
+            node.flags &= ~CLUSTER_NODE_FAIL; // WHZ 节点可达并且是主节点，但超过 N*NODE_TIMEOUT 没有进行failover。这时最好将该主节点重新加入集群
             managers.notifyUnsetNodeFailed(valueOf(node, server.myself));
         }
     }

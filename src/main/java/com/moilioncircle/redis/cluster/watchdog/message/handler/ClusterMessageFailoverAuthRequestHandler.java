@@ -49,16 +49,18 @@ public class ClusterMessageFailoverAuthRequestHandler extends AbstractClusterMes
         clusterSendFailoverAuthIfNeeded(sender, hdr);
         return true;
     }
-    
-    public void clusterSendFailoverAuthIfNeeded(ClusterNode node, ClusterMessage hdr) {
+
+    /* Vote for the node asking for our vote if there are the conditions. */
+    public void clusterSendFailoverAuthIfNeeded(ClusterNode node, ClusterMessage hdr) { //WHZ master 收到 CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST 给slave投票
         ClusterNode master = node.master;
         long now = System.currentTimeMillis();
         boolean force = (hdr.messageFlags[0] & CLUSTERMSG_FLAG0_FORCEACK) != 0;
         //
-        if (nodeIsSlave(server.myself)) return;
-        if (server.myself.assignedSlots == 0) return;
-        if (hdr.currentEpoch < server.cluster.currentEpoch) return;
-        if (server.cluster.lastVoteEpoch == server.cluster.currentEpoch) return;
+        if (nodeIsSlave(server.myself)) return; //WHZ master 才有投票权
+        if (server.myself.assignedSlots == 0) return; // WHZ 本阶段没有管理的 slots，没投票权
+        if (hdr.currentEpoch < server.cluster.currentEpoch) return; // 选票 currentEpoch 小于自身 currentEpoch 不投票
+        if (server.cluster.lastVoteEpoch == server.cluster.currentEpoch) return; // WHZ 主节点在一个currentEpoch只会投票一次，
+                                                                                 // WHZ 只有从节点携带的currentEpoch大于lastVoteEpoch 才会投票
         if (nodeIsMaster(node) || master == null || (!nodeFailed(master) && !force)) return;
         if (now - master.votedTime < managers.configuration.getClusterNodeTimeout() * 2) return;
         
